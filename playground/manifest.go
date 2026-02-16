@@ -220,34 +220,31 @@ func (s *Manifest) Validate(out *output) error {
 	for _, ss := range s.Services {
 		// override ready checks that use the QueryURL feature
 		if ss.ReadyCheck != nil && ss.ReadyCheck.QueryURL != "" {
-			// For host-executed services, keep the ReadyCheck on the service itself
-			// so that local_runner can poll it directly. Don't create a sidecar.
 			if ss.HostPath != "" {
 				// Host services are polled directly by local_runner.go waitForDependencies()
-				// Keep the ReadyCheck intact for that polling logic
-				continue
+				// Keep the ReadyCheck intact for that polling logic. Don't create a sidecar.
+			} else {
+				// For Docker services, create a sidecar container with curl to perform the check.
+				// Note that we have to remove the ready check from the main service.
+				sidecarName := ss.Name + "_readycheck"
+
+				readyCheck := *ss.ReadyCheck
+				ss.ReadyCheck = nil
+				ss.WithLabel(healthCheckSidecarLabel, sidecarName)
+
+				// the url supplied by the service will bind to localhost, we have to change it
+				// to point to the main service name so that the sidecar can reach it.
+				targetHost := ss.Name
+				readyCheck.QueryURL = strings.ReplaceAll(readyCheck.QueryURL, "localhost", targetHost)
+				readyCheck.Test = []string{"CMD", "curl", readyCheck.QueryURL}
+
+				s.NewService(sidecarName).
+					WithImage("alpine/curl").
+					WithTag("latest").
+					WithArgs("sleep", "infinity").
+					WithReady(readyCheck).
+					WithUngracefulShutdown()
 			}
-
-			// For Docker services, create a sidecar container with curl to perform the check.
-			// Note that we have to remove the ready check from the main service.
-			sidecarName := ss.Name + "_readycheck"
-
-			readyCheck := *ss.ReadyCheck
-			ss.ReadyCheck = nil
-			ss.WithLabel(healthCheckSidecarLabel, sidecarName)
-
-			// the url supplied by the service will bind to localhost, we have to change it
-			// to point to the main service name so that the sidecar can reach it.
-			targetHost := ss.Name
-			readyCheck.QueryURL = strings.ReplaceAll(readyCheck.QueryURL, "localhost", targetHost)
-			readyCheck.Test = []string{"CMD", "curl", readyCheck.QueryURL}
-
-			s.NewService(sidecarName).
-				WithImage("alpine/curl").
-				WithTag("latest").
-				WithArgs("sleep", "infinity").
-				WithReady(readyCheck).
-				WithUngracefulShutdown()
 		}
 
 		// validate node port references

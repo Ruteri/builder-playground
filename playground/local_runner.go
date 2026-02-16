@@ -681,6 +681,25 @@ func (d *LocalRunner) toDockerComposeService(s *Service) (map[string]interface{}
 		service["entrypoint"] = s.Entrypoint
 	}
 
+	// On Linux, containers with local bind-mount volumes run as the host user
+	// to avoid root-owned files. An entrypoint wrapper sets HOME to a writable
+	// location so processes that write to $HOME (e.g. reth logs) don't fail.
+	hasLocalVolume := false
+	for _, volume := range s.VolumesMapped {
+		if volume.IsLocal {
+			hasLocalVolume = true
+			break
+		}
+	}
+	if hasLocalVolume && runtime.GOOS == "linux" {
+		service["user"] = fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
+		if s.Entrypoint == "" {
+			return nil, nil, fmt.Errorf("service %s has local volumes but no explicit entrypoint", s.Name)
+		}
+		service["entrypoint"] = []string{"/artifacts/docker-entrypoint-wrapper.sh"}
+		service["command"] = append([]string{s.Entrypoint}, args...)
+	}
+
 	if len(s.Ports) > 0 {
 		ports := []string{}
 		for _, p := range s.Ports {
@@ -778,6 +797,46 @@ func (d *LocalRunner) createVolumeDir(service, volumeName string) (string, error
 		return "", fmt.Errorf("failed to create volume dir %s: %w", volumeName, err)
 	}
 	return volumeDirAbsPath, nil
+}
+
+// symlinkLocalVolumes creates symlinks in the artifacts directory for Docker local
+// bind-mount volumes. Docker stores these in a temp directory, but host processes
+// (like the merger) may reference them via relative paths from the artifacts dir.
+func (d *LocalRunner) symlinkLocalVolumes() {
+	seen := map[string]bool{}
+	for _, svc := range d.manifest.Services {
+		if d.isHostService(svc.Name) {
+			continue
+		}
+		for _, volume := range svc.VolumesMapped {
+			if !volume.IsLocal {
+				continue
+			}
+			volumeDirName := d.createVolumeName(svc.Name, volume.Name)
+			if seen[volumeDirName] {
+				continue
+			}
+			seen[volumeDirName] = true
+
+			actualPath := utils.MustGetVolumeDir(d.manifest.ID, volumeDirName)
+			symlinkPath := filepath.Join(d.out.dst, volumeDirName)
+
+			if _, err := os.Lstat(symlinkPath); err != nil {
+				if err := os.Symlink(actualPath, symlinkPath); err != nil {
+					slog.Warn("Failed to create volume symlink", "from", symlinkPath, "to", actualPath, "error", err)
+				}
+			}
+		}
+	}
+}
+
+// writeEntrypointWrapper creates a small shell script that sets HOME to a writable
+// location before exec'ing the original command. This is needed when containers run
+// as the host user (non-root) — some processes (e.g. reth) write to $HOME on startup.
+func (d *LocalRunner) writeEntrypointWrapper() error {
+	const script = "#!/bin/sh\nexport HOME=/tmp/playground-home\nmkdir -p \"$HOME\"\nexec \"$@\"\n"
+	path := filepath.Join(d.out.dst, "docker-entrypoint-wrapper.sh")
+	return os.WriteFile(path, []byte(script), 0755)
 }
 
 // waitForDependencies waits for all dependencies of a host service to be healthy
@@ -905,8 +964,6 @@ func (d *LocalRunner) runOnHost(ss *Service) error {
 	}
 
 	execPath := ss.HostPath
-	cmd := exec.Command(execPath, args...)
-	cmd.Dir = d.out.dst // Run from artifacts directory so relative paths work
 
 	logOutput, err := d.out.LogOutput(ss.Name)
 	if err != nil {
@@ -919,30 +976,58 @@ func (d *LocalRunner) runOnHost(ss *Service) error {
 	cmdLine := execPath + " " + strings.Join(args, " ")
 	fmt.Fprint(logOutput, cmdLine+"\n\n")
 
-	cmd.Stdout = logOutput
-	cmd.Stderr = logOutput
+	// Create a handle for process cleanup. The goroutine updates handle.Process
+	// when each attempt starts so that stopAllProcessesWithSignal can kill it.
+	handle := &exec.Cmd{}
+	d.handles = append(d.handles, handle)
 
 	go func() {
-		if err := cmd.Run(); err != nil {
-			// If the playground is being exited, ignore the exit error info
-			// to make the outputs less confusing.
-			if mainctx.IsExiting() {
+		// Retry host service startup a few times if it fails quickly.
+		// This handles transient issues like Docker port forwarding not being
+		// fully stable when the service first connects to container endpoints.
+		const maxRetries = 5
+		const retryDelay = 5 * time.Second
+		const quickFailThreshold = 10 * time.Second
+
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			cmd := exec.Command(execPath, args...)
+			cmd.Dir = d.out.dst
+			cmd.Stdout = logOutput
+			cmd.Stderr = logOutput
+
+			if err := cmd.Start(); err != nil {
+				slog.Error("Host service failed to start", "service", ss.Name, "error", err)
+				d.sendExitError(fmt.Errorf("service %s failed to start: %w", ss.Name, err))
 				return
 			}
-			// Read last lines from log file for context
-			lastLines := readLastLines(logPath, 10)
-			slog.Error("Host service failed", "service", ss.Name, "error", err)
-			errMsg := fmt.Sprintf("service %s failed:\n  Command: %s\n  Log file: %s\n  Exit error: %v",
-				ss.Name, execPath, logPath, err)
-			if lastLines != "" {
-				errMsg += fmt.Sprintf("\n  Last output:\n%s", lastLines)
+			handle.Process = cmd.Process
+
+			startTime := time.Now()
+			err := cmd.Wait()
+			if err == nil || mainctx.IsExiting() {
+				return
 			}
-			d.sendExitError(fmt.Errorf("%s", errMsg))
+
+			elapsed := time.Since(startTime)
+			if elapsed > quickFailThreshold || attempt == maxRetries-1 {
+				// Process ran for a while or last retry - treat as real failure
+				lastLines := readLastLines(logPath, 10)
+				slog.Error("Host service failed", "service", ss.Name, "error", err)
+				errMsg := fmt.Sprintf("service %s failed:\n  Command: %s\n  Log file: %s\n  Exit error: %v",
+					ss.Name, execPath, logPath, err)
+				if lastLines != "" {
+					errMsg += fmt.Sprintf("\n  Last output:\n%s", lastLines)
+				}
+				d.sendExitError(fmt.Errorf("%s", errMsg))
+				return
+			}
+
+			slog.Info("Host service failed quickly, retrying",
+				"service", ss.Name, "attempt", attempt+1, "elapsed", elapsed)
+			fmt.Fprintf(logOutput, "\n--- Retrying (attempt %d/%d, failed after %s) ---\n\n", attempt+2, maxRetries, elapsed)
+			time.Sleep(retryDelay)
 		}
 	}()
-
-	// we do not need to lock this array because we run the host services sequentially
-	d.handles = append(d.handles, cmd)
 	return nil
 }
 
@@ -1147,6 +1232,12 @@ func (d *LocalRunner) Run(ctx context.Context) error {
 
 	go d.trackContainerStatusAndLogs()
 
+	if runtime.GOOS == "linux" {
+		if err := d.writeEntrypointWrapper(); err != nil {
+			return fmt.Errorf("failed to write entrypoint wrapper: %w", err)
+		}
+	}
+
 	yamlData, err := d.generateDockerCompose()
 	if err != nil {
 		return fmt.Errorf("failed to generate docker-compose.yaml: %w", err)
@@ -1182,6 +1273,11 @@ func (d *LocalRunner) Run(ctx context.Context) error {
 		}
 		return fmt.Errorf("failed to run docker-compose: %w, err: %s", err, errOut.String())
 	}
+
+	// Create symlinks in the artifacts directory for Docker local bind-mount volumes.
+	// This allows host processes to access Docker volumes via relative paths
+	// (e.g., merger.toml using reth_datadir = "volume-el-data").
+	d.symlinkLocalVolumes()
 
 	// Second, start the services that are running on the host machine
 	// Start them in parallel - each will wait for its own dependencies
